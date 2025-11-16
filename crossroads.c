@@ -85,6 +85,7 @@ typedef struct {
     float eq_hp_state[2];
     double duration;
     char path[PATH_MAX];
+    int playlist_index;
 } Deck;
 
 typedef enum {
@@ -120,6 +121,15 @@ typedef enum {
     CMD_EQ_BAND_MASTER,
     CMD_SET_SAMPLE_DURATION,
     CMD_SET_SAMPLE_GAIN,
+    CMD_SET_AUTO_NEXT_A,
+    CMD_SET_AUTO_NEXT_B,
+    CMD_SET_EQ_DYN_MODE,
+    CMD_SET_EQ_DYN_SPEED,
+    CMD_SET_EQ_DYN_DEPTH,
+    CMD_PREV_A,
+    CMD_PREV_B,
+    CMD_NEXT_A,
+    CMD_NEXT_B,
     CMD_QUIT
 } CommandType;
 
@@ -163,9 +173,16 @@ typedef struct {
     GtkWidget *sample_duration;
     GtkWidget *sample_gain;
     GtkWidget *sample_play;
+    GtkWidget *auto_next_a;
+    GtkWidget *auto_next_b;
+    GtkWidget *eq_dyn_mode;
+    GtkWidget *eq_dyn_speed;
+    GtkWidget *eq_dyn_depth;
 } UI;
 
 static gboolean g_updating_seek = FALSE;
+static gboolean g_updating_sliders = FALSE;
+static gboolean g_updating_eq_sliders = FALSE;
 
 typedef struct {
     Playlist playlist;
@@ -182,8 +199,16 @@ typedef struct {
     GAsyncQueue *queue;
     float deck_eq_bands[2][10];
     float master_eq_bands[10];
+    float master_dyn_bands[10];
+    int master_dyn_active;
     double sample_duration;
     float sample_gain;
+    int auto_next[2];
+    int eq_dyn_mode;
+    double eq_dyn_phase;
+    double eq_dyn_speed;
+    double eq_dyn_depth;
+    double eq_dyn_last;
 } EngineState;
 
 typedef struct {
@@ -314,13 +339,22 @@ static void destroy_deck(Deck *d) {
     d->gain_mul = 1.0f;
 }
 
-static int init_deck(Deck *d, const char *path, float target_bpm, int beatmatch, char *err, size_t errsz) {
+static int init_deck(Deck *d, const char *path, int playlist_index, float target_bpm, int beatmatch, char *err, size_t errsz) {
     destroy_deck(d);
     safe_copy(d->path, sizeof(d->path), path);
     d->beatmatch = beatmatch;
     d->target_bpm = target_bpm;
+    d->playlist_index = playlist_index;
     d->sf = sf_open(path, SFM_READ, &d->info);
     if (!d->sf) { snprintf(err, errsz, "sndfile: %s", sf_strerror(NULL)); return -1; }
+    if (d->info.channels < 1 || d->info.channels > 2) {
+        snprintf(err, errsz, "unsupported channel count: %d", d->info.channels);
+        sf_close(d->sf); d->sf = NULL; return -1;
+    }
+    if (d->info.samplerate <= 0) {
+        snprintf(err, errsz, "invalid samplerate: %d", d->info.samplerate);
+        sf_close(d->sf); d->sf = NULL; return -1;
+    }
     alGenSources(1, &d->source);
     alGenBuffers(STREAM_BUFFERS, d->buffers);
     d->buf_index = 0;
@@ -354,13 +388,20 @@ static int init_deck(Deck *d, const char *path, float target_bpm, int beatmatch,
     return 0;
 }
 
+static float compute_base_ratio(const Deck *d, float target_bpm) {
+    if (d->detected_bpm <= 0) return 1.0f;
+    float r = target_bpm > 0 ? target_bpm / d->detected_bpm : 1.0f;
+    if (r < 0.5f) r = 0.5f;
+    if (r > 2.0f) r = 2.0f;
+    return r;
+}
+
 static void apply_tempo(Deck *d, float target_bpm, int beatmatch) {
     if (!d->st) return;
     if (!beatmatch || d->detected_bpm <= 0) return;
-    float ratio = d->detected_bpm > 0 ? target_bpm / d->detected_bpm : 1.0f;
-    ratio *= d->tempo_mul;
-    if (ratio < 0.5f) ratio = 0.5f;
-    if (ratio > 2.0f) ratio = 2.0f;
+    float ratio = compute_base_ratio(d, target_bpm) * d->tempo_mul;
+    if (ratio < 0.25f) ratio = 0.25f;
+    if (ratio > 4.0f) ratio = 4.0f;
     g_st.setTempo(d->st, ratio);
     float pitch = d->pitch_mul;
     if (pitch < 0.5f) pitch = 0.5f;
@@ -484,20 +525,28 @@ static void bands_to_lmh(const float bands[10], float *low, float *mid, float *h
     *high = h > 0.f ? h : 0.f;
 }
 
-static void refresh_eq_for_deck(EngineState *e, int deck_id) {
+static void refresh_eq_for_deck_with_master(EngineState *e, int deck_id, const float master[10]) {
     if (deck_id < 0 || deck_id > 1) return;
     float dl = 1.f, dm = 1.f, dh = 1.f;
     float ml = 1.f, mm = 1.f, mh = 1.f;
     bands_to_lmh(e->deck_eq_bands[deck_id], &dl, &dm, &dh);
-    bands_to_lmh(e->master_eq_bands, &ml, &mm, &mh);
+    bands_to_lmh(master, &ml, &mm, &mh);
     e->decks[deck_id].eq_low = dl * ml;
     e->decks[deck_id].eq_mid = dm * mm;
     e->decks[deck_id].eq_high = dh * mh;
 }
 
+static void refresh_eq_for_deck(EngineState *e, int deck_id) {
+    refresh_eq_for_deck_with_master(e, deck_id, e->master_eq_bands);
+}
+
+static void refresh_all_eq_with_master(EngineState *e, const float master[10]) {
+    refresh_eq_for_deck_with_master(e, 0, master);
+    refresh_eq_for_deck_with_master(e, 1, master);
+}
+
 static void refresh_all_eq(EngineState *e) {
-    refresh_eq_for_deck(e, 0);
-    refresh_eq_for_deck(e, 1);
+    refresh_all_eq_with_master(e, e->master_eq_bands);
 }
 
 typedef struct {
@@ -551,19 +600,50 @@ static void play_sample_tone(EngineState *e, double freq) {
     g_thread_new("sample", sample_thread, p);
 }
 
+static int load_next_track(EngineState *e, int deck_id) {
+    if (e->playlist.count == 0) return -1;
+    int next = e->decks[deck_id].playlist_index + 1;
+    if (next >= (int)e->playlist.count) next = 0;
+    char err[256];
+    if (init_deck(&e->decks[deck_id], e->playlist.items[next], next, e->target_bpm, e->beatmatch, err, sizeof(err)) != 0) {
+        fprintf(stderr, "Deck %d auto-next failed: %s\n", deck_id, err);
+        return -1;
+    }
+    apply_tempo(&e->decks[deck_id], e->target_bpm, e->beatmatch);
+    refresh_eq_for_deck(e, deck_id);
+    start_deck(&e->decks[deck_id]);
+    return 0;
+}
+
 static void load_and_play_selection(EngineState *e, GtkListBox *list, int deck_id) {
     GtkListBoxRow *row = gtk_list_box_get_selected_row(list);
     if (!row) return;
     int idx = gtk_list_box_row_get_index(row);
     if (idx < 0 || (size_t)idx >= e->playlist.count) return;
     char err[256];
-    if (init_deck(&e->decks[deck_id], e->playlist.items[idx], e->target_bpm, e->beatmatch, err, sizeof(err)) == 0) {
+    if (init_deck(&e->decks[deck_id], e->playlist.items[idx], idx, e->target_bpm, e->beatmatch, err, sizeof(err)) == 0) {
         apply_tempo(&e->decks[deck_id], e->target_bpm, e->beatmatch);
         refresh_eq_for_deck(e, deck_id);
         start_deck(&e->decks[deck_id]);
     } else {
         fprintf(stderr, "Deck %d load failed: %s\n", deck_id, err);
     }
+}
+
+static int load_adjacent_track(EngineState *e, int deck_id, int delta) {
+    if (e->playlist.count == 0) return -1;
+    int idx = e->decks[deck_id].playlist_index;
+    if (idx < 0) idx = 0;
+    int next = (idx + delta + (int)e->playlist.count) % (int)e->playlist.count;
+    char err[256];
+    if (init_deck(&e->decks[deck_id], e->playlist.items[next], next, e->target_bpm, e->beatmatch, err, sizeof(err)) != 0) {
+        fprintf(stderr, "Deck %d adj load failed: %s\n", deck_id, err);
+        return -1;
+    }
+    apply_tempo(&e->decks[deck_id], e->target_bpm, e->beatmatch);
+    refresh_eq_for_deck(e, deck_id);
+    start_deck(&e->decks[deck_id]);
+    return 0;
 }
 
 static gpointer engine_thread(gpointer data) {
@@ -625,7 +705,13 @@ static gpointer engine_thread(gpointer data) {
                 for (int i = 0; i < 2; ++i) apply_tempo(&e->decks[i], e->target_bpm, e->beatmatch);
                 break;
             case CMD_SYNC_NOW:
-                for (int i = 0; i < 2; ++i) apply_tempo(&e->decks[i], e->target_bpm, e->beatmatch);
+                for (int i = 0; i < 2; ++i) {
+                    if (e->decks[i].detected_bpm > 0) {
+                        float base = compute_base_ratio(&e->decks[i], e->target_bpm);
+                        e->decks[i].tempo_mul = base;
+                    }
+                    apply_tempo(&e->decks[i], e->target_bpm, e->beatmatch);
+                }
                 break;
             case CMD_AUTO_XFADE:
                 e->auto_xfade_start = now_sec();
@@ -693,6 +779,28 @@ static gpointer engine_thread(gpointer data) {
                 if (cmd->value > 2.0) cmd->value = 2.0;
                 e->sample_gain = (float)cmd->value;
                 break;
+            case CMD_SET_AUTO_NEXT_A: e->auto_next[0] = (int)cmd->value; break;
+            case CMD_SET_AUTO_NEXT_B: e->auto_next[1] = (int)cmd->value; break;
+            case CMD_SET_EQ_DYN_MODE:
+                e->eq_dyn_mode = (int)cmd->value;
+                e->eq_dyn_phase = 0.0;
+                e->eq_dyn_last = now_sec();
+                if (e->eq_dyn_mode == 0) refresh_all_eq(e);
+                break;
+            case CMD_SET_EQ_DYN_SPEED:
+                if (cmd->value < 0.0) cmd->value = 0.0;
+                if (cmd->value > 10.0) cmd->value = 10.0;
+                e->eq_dyn_speed = cmd->value;
+                break;
+            case CMD_SET_EQ_DYN_DEPTH:
+                if (cmd->value < 0.0) cmd->value = 0.0;
+                if (cmd->value > 1.0) cmd->value = 1.0;
+                e->eq_dyn_depth = cmd->value;
+                break;
+            case CMD_PREV_A: load_adjacent_track(e, 0, -1); break;
+            case CMD_PREV_B: load_adjacent_track(e, 1, -1); break;
+            case CMD_NEXT_A: load_adjacent_track(e, 0, 1); break;
+            case CMD_NEXT_B: load_adjacent_track(e, 1, 1); break;
             case CMD_QUIT:
                 g_free(cmd);
                 return NULL;
@@ -701,6 +809,42 @@ static gpointer engine_thread(gpointer data) {
         }
         update_deck(&e->decks[0]);
         update_deck(&e->decks[1]);
+
+            if (e->eq_dyn_mode > 0 && e->eq_dyn_depth > 0.0 && e->eq_dyn_speed > 0.0) {
+                double now_dyn = now_sec();
+                double dt_dyn = (e->eq_dyn_last > 0.0) ? (now_dyn - e->eq_dyn_last) : 0.0;
+                e->eq_dyn_last = now_dyn;
+                e->eq_dyn_phase += dt_dyn * e->eq_dyn_speed * 2.0 * M_PI;
+                static float master_mod[10];
+            for (int i = 0; i < 10; ++i) {
+                double phase = e->eq_dyn_phase + (2.0 * M_PI * ((double)i / 10.0));
+                double w = 0.0;
+                if (e->eq_dyn_mode == 1) { /* Sinus */
+                    w = sin(phase);
+                } else if (e->eq_dyn_mode == 2) { /* Zickzack (Triangle) */
+                    double t = fmod(phase / (2.0 * M_PI), 1.0);
+                    w = t < 0.5 ? (t * 4.0 - 1.0) : (3.0 - t * 4.0);
+                } else if (e->eq_dyn_mode == 3) { /* PWM/Square */
+                    w = sin(phase) >= 0 ? 1.0 : -1.0;
+                }
+                double mod = 1.0 + e->eq_dyn_depth * w;
+                if (mod < 0.0) mod = 0.0;
+                if (mod > 4.0) mod = 4.0;
+                master_mod[i] = e->master_eq_bands[i] * (float)mod;
+            }
+            refresh_all_eq_with_master(e, master_mod);
+            if (e->eq_dyn_phase > 1000.0) e->eq_dyn_phase = fmod(e->eq_dyn_phase, 2.0 * M_PI);
+            memcpy(e->master_dyn_bands, master_mod, sizeof(master_mod));
+            e->master_dyn_active = 1;
+        } else {
+            e->master_dyn_active = 0;
+        }
+
+        for (int di = 0; di < 2; ++di) {
+            if (e->auto_next[di] && e->decks[di].finished) {
+                load_next_track(e, di);
+            }
+        }
 
         if (e->auto_xfade_active) {
             double t = (now_sec() - e->auto_xfade_start) / e->auto_xfade_dur;
@@ -752,8 +896,16 @@ static void on_seek_b(GtkRange *r, gpointer user_data) {
     if (g_updating_seek) return;
     send_cmd(e, CMD_SEEK_B, gtk_range_get_value(r), -1);
 }
-static void on_tempo_a(GtkRange *r, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_TEMPO_A, gtk_range_get_value(r), -1); }
-static void on_tempo_b(GtkRange *r, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_TEMPO_B, gtk_range_get_value(r), -1); }
+static void on_tempo_a(GtkRange *r, gpointer user_data) {
+    if (g_updating_sliders) return;
+    EngineState *e = user_data;
+    send_cmd(e, CMD_TEMPO_A, gtk_range_get_value(r), -1);
+}
+static void on_tempo_b(GtkRange *r, gpointer user_data) {
+    if (g_updating_sliders) return;
+    EngineState *e = user_data;
+    send_cmd(e, CMD_TEMPO_B, gtk_range_get_value(r), -1);
+}
 static void on_pitch_a(GtkRange *r, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_PITCH_A, gtk_range_get_value(r), -1); }
 static void on_pitch_b(GtkRange *r, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_PITCH_B, gtk_range_get_value(r), -1); }
 static void on_gain_a(GtkRange *r, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_GAIN_A, gtk_range_get_value(r), -1); }
@@ -766,6 +918,7 @@ typedef struct {
 } EqBind;
 static void free_eq_bind(gpointer data, GClosure *closure) { (void)closure; g_free(data); }
 static void on_eq_band(GtkRange *r, gpointer user_data) {
+    if (g_updating_eq_sliders) return;
     EqBind *b = user_data;
     if (!b) return;
     send_cmd(b->eng, b->cmd, gtk_range_get_value(r), b->band);
@@ -788,6 +941,19 @@ static void on_sample_play(GtkButton *b, gpointer user_data) {
     double freq = get_selected_sample_freq(ui);
     send_cmd(e, CMD_PLAY_SAMPLE, freq, -1);
 }
+static void on_auto_next_a(GtkToggleButton *t, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_SET_AUTO_NEXT_A, gtk_toggle_button_get_active(t), -1); }
+static void on_auto_next_b(GtkToggleButton *t, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_SET_AUTO_NEXT_B, gtk_toggle_button_get_active(t), -1); }
+static void on_eq_dyn_mode(GtkComboBox *c, gpointer user_data) {
+    EngineState *e = user_data;
+    int mode = gtk_combo_box_get_active(c);
+    send_cmd(e, CMD_SET_EQ_DYN_MODE, mode, -1);
+}
+static void on_eq_dyn_speed(GtkRange *r, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_SET_EQ_DYN_SPEED, gtk_range_get_value(r), -1); }
+static void on_eq_dyn_depth(GtkRange *r, gpointer user_data) { EngineState *e = user_data; send_cmd(e, CMD_SET_EQ_DYN_DEPTH, gtk_range_get_value(r), -1); }
+static void on_prev_a(GtkButton *b, gpointer user_data) { (void)b; UI *ui = user_data; EngineState *e = g_object_get_data(G_OBJECT(ui->window), "engine"); send_cmd(e, CMD_PREV_A, 0, -1); }
+static void on_prev_b(GtkButton *b, gpointer user_data) { (void)b; UI *ui = user_data; EngineState *e = g_object_get_data(G_OBJECT(ui->window), "engine"); send_cmd(e, CMD_PREV_B, 0, -1); }
+static void on_next_a(GtkButton *b, gpointer user_data) { (void)b; UI *ui = user_data; EngineState *e = g_object_get_data(G_OBJECT(ui->window), "engine"); send_cmd(e, CMD_NEXT_A, 0, -1); }
+static void on_next_b(GtkButton *b, gpointer user_data) { (void)b; UI *ui = user_data; EngineState *e = g_object_get_data(G_OBJECT(ui->window), "engine"); send_cmd(e, CMD_NEXT_B, 0, -1); }
 static void on_auto_xfade(GtkButton *b, gpointer user_data) {
     (void)b;
     UI *ui = user_data;
@@ -801,6 +967,8 @@ static gboolean update_seekbars(gpointer data) {
     EngineState *e = ctx->eng;
     UI *ui = ctx->ui;
     g_updating_seek = TRUE;
+    g_updating_sliders = TRUE;
+    g_updating_eq_sliders = TRUE;
     double pa = e->decks[0].position;
     double pb = e->decks[1].position;
     if (e->decks[0].duration > 0) {
@@ -822,7 +990,16 @@ static gboolean update_seekbars(gpointer data) {
              mb, sb,
              (int)(e->decks[1].duration / 60), (int)((int)e->decks[1].duration % 60));
     gtk_label_set_text(GTK_LABEL(ui->pos_label_b), buf);
+    if (ui->tempo_a) gtk_range_set_value(GTK_RANGE(ui->tempo_a), e->decks[0].tempo_mul);
+    if (ui->tempo_b) gtk_range_set_value(GTK_RANGE(ui->tempo_b), e->decks[1].tempo_mul);
+    if (ui->eq_bands_master[0]) {
+        const float *src = e->master_eq_bands;
+        if (e->master_dyn_active) src = e->master_dyn_bands;
+        for (int i = 0; i < 10; ++i) gtk_range_set_value(GTK_RANGE(ui->eq_bands_master[i]), src[i]);
+    }
     g_updating_seek = FALSE;
+    g_updating_sliders = FALSE;
+    g_updating_eq_sliders = FALSE;
     return TRUE;
 }
 
@@ -904,19 +1081,34 @@ static GtkWidget *create_deck_column(UI *ui, EngineState *e, int deck_id, GtkAli
 
     GtkWidget *transport = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_halign(transport, align);
+    GtkWidget *prev_btn = gtk_button_new_with_label("Prev");
+    gtk_box_pack_start(GTK_BOX(transport), prev_btn, FALSE, FALSE, 0);
+    if (deck_id == 0) g_signal_connect(prev_btn, "clicked", G_CALLBACK(on_prev_a), ui);
+    else g_signal_connect(prev_btn, "clicked", G_CALLBACK(on_prev_b), ui);
     GtkWidget *play_btn = gtk_button_new_with_label(deck_id == 0 ? "Play Deck A" : "Play Deck B");
     gtk_box_pack_start(GTK_BOX(transport), play_btn, FALSE, FALSE, 0);
     if (deck_id == 0) { ui->play_a = play_btn; g_signal_connect(play_btn, "clicked", G_CALLBACK(on_play_a), ui); }
     else { ui->play_b = play_btn; g_signal_connect(play_btn, "clicked", G_CALLBACK(on_play_b), ui); }
-    GtkWidget *pp = gtk_button_new_with_label(deck_id == 0 ? "Play/Pause A" : "Play/Pause B");
+    GtkWidget *pp = gtk_button_new_with_label("Play/Pause");
     gtk_box_pack_start(GTK_BOX(transport), pp, FALSE, FALSE, 0);
     if (deck_id == 0) { ui->pp_a = pp; g_signal_connect(pp, "clicked", G_CALLBACK(on_pp_a), e); }
     else { ui->pp_b = pp; g_signal_connect(pp, "clicked", G_CALLBACK(on_pp_b), e); }
-    GtkWidget *stop = gtk_button_new_with_label(deck_id == 0 ? "Stop A" : "Stop B");
+    GtkWidget *stop = gtk_button_new_with_label("Stop");
     gtk_box_pack_start(GTK_BOX(transport), stop, FALSE, FALSE, 0);
     if (deck_id == 0) { ui->stop_a = stop; g_signal_connect(stop, "clicked", G_CALLBACK(on_stop_a), e); }
     else { ui->stop_b = stop; g_signal_connect(stop, "clicked", G_CALLBACK(on_stop_b), e); }
+    GtkWidget *next_btn = gtk_button_new_with_label("Next");
+    gtk_box_pack_start(GTK_BOX(transport), next_btn, FALSE, FALSE, 0);
+    if (deck_id == 0) g_signal_connect(next_btn, "clicked", G_CALLBACK(on_next_a), ui);
+    else g_signal_connect(next_btn, "clicked", G_CALLBACK(on_next_b), ui);
     gtk_box_pack_start(GTK_BOX(col), transport, FALSE, FALSE, 0);
+
+    GtkWidget *auto_next = gtk_check_button_new_with_label("Autoplay nächster Track");
+    gtk_widget_set_halign(auto_next, align);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(auto_next), e->auto_next[deck_id]);
+    if (deck_id == 0) { ui->auto_next_a = auto_next; g_signal_connect(auto_next, "toggled", G_CALLBACK(on_auto_next_a), e); }
+    else { ui->auto_next_b = auto_next; g_signal_connect(auto_next, "toggled", G_CALLBACK(on_auto_next_b), e); }
+    gtk_box_pack_start(GTK_BOX(col), auto_next, FALSE, FALSE, 0);
 
     GtkWidget *gain_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     GtkWidget *gain_label = gtk_label_new(deck_id == 0 ? "Gain A" : "Gain B");
@@ -1070,6 +1262,38 @@ static void build_ui(UI *ui, EngineState *e) {
     GtkWidget *master_eq = create_eq_section(ui, e, "Master EQ (10-Band)", ui->eq_bands_master, CMD_EQ_BAND_MASTER, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(center_col), master_eq, FALSE, FALSE, 0);
 
+    GtkWidget *dyn_label = gtk_label_new("Dynamischer EQ");
+    gtk_widget_set_halign(dyn_label, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(center_col), dyn_label, FALSE, FALSE, 0);
+
+    ui->eq_dyn_mode = gtk_combo_box_text_new();
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->eq_dyn_mode), "0", "Aus");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->eq_dyn_mode), "1", "Sinus");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->eq_dyn_mode), "2", "Zickzack");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->eq_dyn_mode), "3", "PWM");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ui->eq_dyn_mode), e->eq_dyn_mode);
+    gtk_widget_set_halign(ui->eq_dyn_mode, GTK_ALIGN_CENTER);
+    g_signal_connect(ui->eq_dyn_mode, "changed", G_CALLBACK(on_eq_dyn_mode), e);
+    gtk_box_pack_start(GTK_BOX(center_col), ui->eq_dyn_mode, FALSE, FALSE, 0);
+
+    GtkWidget *dyn_speed_label = gtk_label_new("Dyn Speed (Hz)");
+    gtk_widget_set_halign(dyn_speed_label, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(center_col), dyn_speed_label, FALSE, FALSE, 0);
+    ui->eq_dyn_speed = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.1, 10.0, 0.05);
+    gtk_range_set_value(GTK_RANGE(ui->eq_dyn_speed), e->eq_dyn_speed);
+    gtk_widget_set_hexpand(ui->eq_dyn_speed, TRUE);
+    g_signal_connect(ui->eq_dyn_speed, "value-changed", G_CALLBACK(on_eq_dyn_speed), e);
+    gtk_box_pack_start(GTK_BOX(center_col), ui->eq_dyn_speed, FALSE, FALSE, 0);
+
+    GtkWidget *dyn_depth_label = gtk_label_new("Dyn Tiefe");
+    gtk_widget_set_halign(dyn_depth_label, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(center_col), dyn_depth_label, FALSE, FALSE, 0);
+    ui->eq_dyn_depth = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 1.0, 0.05);
+    gtk_range_set_value(GTK_RANGE(ui->eq_dyn_depth), e->eq_dyn_depth);
+    gtk_widget_set_hexpand(ui->eq_dyn_depth, TRUE);
+    g_signal_connect(ui->eq_dyn_depth, "value-changed", G_CALLBACK(on_eq_dyn_depth), e);
+    gtk_box_pack_start(GTK_BOX(center_col), ui->eq_dyn_depth, FALSE, FALSE, 0);
+
     gtk_grid_attach(GTK_GRID(grid), left_col, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), center_col, 1, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), right_col, 2, 0, 1, 1);
@@ -1164,6 +1388,13 @@ int main(int argc, char **argv) {
     eng.master_gain = 1.0f;
     eng.sample_duration = 1.0;
     eng.sample_gain = 0.6f;
+    eng.eq_dyn_mode = 0;
+    eng.eq_dyn_phase = 0.0;
+    eng.eq_dyn_speed = 2.0;
+    eng.eq_dyn_depth = 0.0;
+    eng.eq_dyn_last = 0.0;
+    eng.auto_next[0] = eng.auto_next[1] = 0;
+    eng.master_dyn_active = 0;
     for (int d = 0; d < 2; ++d) {
         for (int i = 0; i < 10; ++i) eng.deck_eq_bands[d][i] = 1.0f;
     }
@@ -1183,8 +1414,14 @@ int main(int argc, char **argv) {
     eng.queue = g_async_queue_new();
 
     if (eng.playlist.count > 0) {
-        init_deck(&eng.decks[0], eng.playlist.items[0], eng.target_bpm, eng.beatmatch, err, sizeof(err));
-        init_deck(&eng.decks[1], eng.playlist.items[0], eng.target_bpm, eng.beatmatch, err, sizeof(err));
+        if (init_deck(&eng.decks[0], eng.playlist.items[0], 0, eng.target_bpm, eng.beatmatch, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Deck A Init fehlgeschlagen: %s\n", err);
+            return 1;
+        }
+        if (init_deck(&eng.decks[1], eng.playlist.items[0], 0, eng.target_bpm, eng.beatmatch, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Deck B Init fehlgeschlagen: %s\n", err);
+            return 1;
+        }
         set_crossfader(&eng, 0.5);
         refresh_all_eq(&eng);
     }
